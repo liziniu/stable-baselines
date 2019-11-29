@@ -1,8 +1,10 @@
 import tensorflow as tf
 import numpy as np
 from gym.spaces import Box
+from scipy import stats
 
 from stable_baselines.common.policies import BasePolicy, nature_cnn, register_policy
+from stable_baselines.common.distributions import DiagGaussianProbabilityDistribution
 
 EPS = 1e-6  # Avoid NaN (prevents division by zero or log of zero)
 # CAP the standard deviation of the actor
@@ -196,6 +198,9 @@ class FeedForwardPolicy(SACPolicy):
         self.reg_loss = None
         self.reg_weight = reg_weight
         self.entropy = None
+        self.logp_pi = None
+        self.logp_act = None
+        self.pd = None
 
         assert len(layers) >= 1, "Error: must have at least one hidden layer for the policy."
 
@@ -230,6 +235,8 @@ class FeedForwardPolicy(SACPolicy):
         log_std = tf.clip_by_value(log_std, LOG_STD_MIN, LOG_STD_MAX)
 
         self.std = std = tf.exp(log_std)
+        self.pd = DiagGaussianProbabilityDistribution(tf.concat(
+            [self.act_mu, self.act_mu * 0.0 + log_std], axis=1))
         # Reparameterization trick
         pi_ = mu_ + tf.random_normal(tf.shape(mu_)) * std
         logp_pi = gaussian_likelihood(pi_, mu_, log_std)
@@ -238,6 +245,11 @@ class FeedForwardPolicy(SACPolicy):
         # Apply squashing and account for it in the probabilty
         deterministic_policy, policy, logp_pi = apply_squashing_func(mu_, pi_, logp_pi)
         self.policy = policy
+        self.logp_pi = logp_pi
+
+        pi_act = tf.atanh(self.action_ph)
+        logp_pi_act = -self.pd.neglogp(pi_act)
+        _, _, self.logp_act = apply_squashing_func(mu_, tf.cast(pi_act, tf.float64), tf.cast(logp_pi_act, tf.float64))
         self.deterministic_policy = deterministic_policy
 
         return deterministic_policy, policy, logp_pi
@@ -280,11 +292,14 @@ class FeedForwardPolicy(SACPolicy):
 
     def step(self, obs, state=None, mask=None, deterministic=False):
         if deterministic:
-            return self.sess.run(self.deterministic_policy, {self.obs_ph: obs})
-        return self.sess.run(self.policy, {self.obs_ph: obs})
+            return self.sess.run([self.deterministic_policy, self.logp_pi], {self.obs_ph: obs})
+        return self.sess.run([self.policy, self.logp_pi],  {self.obs_ph: obs})
 
     def proba_step(self, obs, state=None, mask=None):
         return self.sess.run([self.act_mu, self.std], {self.obs_ph: obs})
+
+    def evaluate_logp(self, obs, action):
+        return self.sess.run(self.logp_act, {self.obs_ph: obs, self.action_ph: action})
 
 
 class CnnPolicy(FeedForwardPolicy):

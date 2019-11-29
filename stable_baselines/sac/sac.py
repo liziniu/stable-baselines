@@ -2,6 +2,9 @@ import sys
 import time
 from collections import deque
 import warnings
+import os
+import os.path as osp
+import pickle
 
 import numpy as np
 import tensorflow as tf
@@ -366,13 +369,16 @@ class SAC(OffPolicyRLModel):
 
         return policy_loss, qf1_loss, qf2_loss, value_loss, entropy
 
-    def learn(self, total_timesteps, callback=None,
+    def learn(self, total_timesteps, callback=None, model_save_interval=None, save_samples=False,
               log_interval=4, tb_log_name="SAC", reset_num_timesteps=True, replay_wrapper=None):
-
+        if save_samples and self.n_envs != 1:
+            raise NotImplementedError("Current only support n_env=1 when save_samples !")
         new_tb_log = self._init_num_timesteps(reset_num_timesteps)
 
         if replay_wrapper is not None:
             self.replay_buffer = replay_wrapper(self.replay_buffer)
+
+        mb_obs, mb_acs, mb_mus, mb_rs, mb_dones, = [], [], [], [], []
 
         with SetVerbosity(self.verbose), TensorboardWriter(self.graph, self.tensorboard_log, tb_log_name, new_tb_log) \
                 as writer:
@@ -393,6 +399,7 @@ class SAC(OffPolicyRLModel):
             self.episode_reward = np.zeros((1,))
             ep_info_buf = deque(maxlen=100)
             n_updates = 0
+            n_saves = 0
             infos_values = []
 
             for step in range(total_timesteps):
@@ -411,8 +418,10 @@ class SAC(OffPolicyRLModel):
                     # but algorithm operates on tanh-squashed actions therefore simple scaling is used
                     unscaled_action = self.env.action_space.sample()
                     action = scale_action(self.action_space, unscaled_action)
+                    logp = np.nan
                 else:
-                    action = self.policy_tf.step(obs[None], deterministic=False).flatten()
+                    action, logp = self.policy_tf.step(obs[None], deterministic=False)
+                    action, logp = action.flatten(), logp.flatten()
                     # Add noise to the action (improve exploration,
                     # not needed in general)
                     if self.action_noise is not None:
@@ -426,6 +435,12 @@ class SAC(OffPolicyRLModel):
 
                 # Store transition in the replay buffer.
                 self.replay_buffer.add(obs, action, reward, new_obs, float(done))
+                if save_samples:
+                    mb_obs.append(obs.flatten())
+                    mb_acs.append(unscaled_action.flatten())
+                    mb_rs.append(reward)
+                    mb_dones.append(done)
+                    mb_mus.append(np.exp(logp).flatten())
                 obs = new_obs
 
                 # Retrieve reward and episode length if using Monitor wrapper
@@ -463,6 +478,13 @@ class SAC(OffPolicyRLModel):
                     if len(mb_infos_vals) > 0:
                         infos_values = np.mean(mb_infos_vals, axis=0)
 
+                if model_save_interval is not None and step % int(model_save_interval) == 0:
+                    savedir = osp.join(logger.get_dir(), 'checkpoints')
+                    os.makedirs(savedir, exist_ok=True)
+                    savepath = osp.join(savedir, str(step))
+                    self.save(savepath)
+                    logger.info("save SAC model into: {}".format(savepath))
+
                 episode_rewards[-1] += reward
                 if done:
                     if self.action_noise is not None:
@@ -474,6 +496,22 @@ class SAC(OffPolicyRLModel):
                     maybe_is_success = info.get('is_success')
                     if maybe_is_success is not None:
                         episode_successes.append(float(maybe_is_success))
+
+                    if save_samples:
+                        n_saves += 1
+                        savedir = osp.join(logger.get_dir(), "runner")
+                        os.makedirs(savedir, exist_ok=True)
+                        with open(osp.join(savedir, "samples_0.pkl"), "ab+") as f:
+                            data = dict(
+                                obs=np.asarray(mb_obs, dtype=self.observation_space.dtype),
+                                acs=np.asarray(mb_acs, dtype=self.action_space.dtype),
+                                rs=np.asarray(mb_rs, dtype=np.float32),
+                                mus=np.asarray(mb_mus, dtype=np.float32),
+                                dones=np.asarray(mb_dones, dtype=np.bool))
+                            pickle.dump(data, f)
+                            logger.info("save trajectory {} with ret:{:.2f}, len:{}".format(
+                                n_saves, np.sum(mb_rs), len(mb_obs)))
+                            mb_obs, mb_acs, mb_mus, mb_rs, mb_dones, = [], [], [], [], []
 
                 if len(episode_rewards[-101:-1]) == 0:
                     mean_reward = -np.inf
@@ -519,7 +557,7 @@ class SAC(OffPolicyRLModel):
         vectorized_env = self._is_vectorized_observation(observation, self.observation_space)
 
         observation = observation.reshape((-1,) + self.observation_space.shape)
-        actions = self.policy_tf.step(observation, deterministic=deterministic)
+        actions, logps = self.policy_tf.step(observation, deterministic=deterministic)
         actions = actions.reshape((-1,) + self.action_space.shape)  # reshape to the correct action shape
         actions = unscale_action(self.action_space, actions) # scale the output for the prediction
 

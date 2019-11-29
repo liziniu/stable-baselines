@@ -108,7 +108,7 @@ class BasePolicy(ABC):
     recurrent = False
 
     def __init__(self, sess, ob_space, ac_space, n_env, n_steps, n_batch, reuse=False, scale=False,
-                 obs_phs=None, add_action_ph=False):
+                 obs_phs=None, add_action_ph=True):
         self.n_env = n_env
         self.n_steps = n_steps
         self.n_batch = n_batch
